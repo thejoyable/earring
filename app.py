@@ -1,4 +1,4 @@
-```python
+
 """
 AR Earring Virtual Try-On – Streamlit + WebRTC
 Stable version for Streamlit Cloud
@@ -318,4 +318,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
+
