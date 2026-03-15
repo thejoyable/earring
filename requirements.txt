@@ -1,6 +1,55 @@
-streamlit
-streamlit-webrtc
-opencv-python-headless
-mediapipe
-numpy
-av
+# Smart Parking Streamlit Application Requirements
+# Core Streamlit and Web Framework
+streamlit>=1.28.0
+streamlit-webrtc>=0.47.0
+
+# Computer Vision and AI/ML - FIXED: Using headless version to avoid libGL.so.1 error
+opencv-python-headless>=4.8.0
+opencv-contrib-python-headless>=4.8.0
+mediapipe>=0.10.0
+ultralytics>=8.0.0
+Pillow>=10.0.0
+
+# Data Processing and Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Date and Time Processing
+python-dateutil>=2.8.0
+
+# Image Processing and Computer Vision
+av>=10.0.0
+aiortc>=1.6.0
+
+# WebRTC and Real-time Communication
+aiohttp>=3.8.0
+websockets>=11.0.0
+
+# HTTP and Network
+requests>=2.31.0
+urllib3>=2.0.0
+
+# System and OS
+psutil>=5.9.0
+
+# Audio Processing (for alerts/buzzer functionality)
+sounddevice>=0.4.0
+
+# Additional Dependencies for YOLO and Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+scipy>=1.10.0
+
+# File Processing and Utilities
+PyYAML>=6.0
+tqdm>=4.64.0
+matplotlib>=3.5.0
+
+# Optional: Enhanced Performance
+# numba>=0.57.0  # Uncomment for faster computations
+# cython>=3.0.0  # Uncomment for compiled extensions
+
+# Development and Testing (Optional)
+# pytest>=7.4.0
+# black>=23.0.0
+# flake8>=6.0.0
