@@ -1,9 +1,5 @@
 """
-AR Earring Virtual Try-On  –  Streamlit + streamlit-webrtc
-==========================================================
-Drop-in replacement that runs in the browser with real-time
-webcam via WebRTC.  Deploy on Streamlit Cloud, HuggingFace
-Spaces, or any server.
+AR Earring Virtual Try-On – Streamlit + streamlit-webrtc
 """
 
 import cv2
@@ -12,411 +8,368 @@ import mediapipe as mp
 import math
 import time
 import streamlit as st
-from streamlit_webrtc import (
-    webrtc_streamer,
-    VideoProcessorBase,
-    WebRtcMode,
-)
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 from pathlib import Path
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  CONFIG                                                      ║
-# ╚══════════════════════════════════════════════════════════════╝
-NOSE            = 1
-LEFT_TRAG       = 234
-RIGHT_TRAG      = 454
-LEFT_EYE_OUTER  = 33
+
+# -------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------
+NOSE = 1
+LEFT_TRAG = 234
+RIGHT_TRAG = 454
+LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
-LEFT_BASE       = 93
-LEFT_REF        = 123
-RIGHT_BASE      = 323
-RIGHT_REF       = 352
-FOREHEAD        = 10
-CHIN            = 152
 
-VIS_RATIO_THRESH   = 0.75
-EARLOBE_OFFSET     = 0.47
+LEFT_BASE = 93
+LEFT_REF = 123
+RIGHT_BASE = 323
+RIGHT_REF = 352
+
+FOREHEAD = 10
+CHIN = 152
+
+VIS_RATIO_THRESH = 0.75
+EARLOBE_OFFSET = 0.47
 EARRING_SIZE_RATIO = 0.25
-TILT_DAMPING       = 0.35
-FADE_SPEED         = 0.15
-ANCHOR_Y_SHIFT     = 0.0
+
+TILT_DAMPING = 0.35
+FADE_SPEED = 0.15
+ANCHOR_Y_SHIFT = 0.0
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  ONE EURO FILTER                                             ║
-# ╚══════════════════════════════════════════════════════════════╝
+# -------------------------------------------------------
+# ONE EURO FILTER
+# -------------------------------------------------------
 class OneEuroFilter:
+
     def __init__(self, t0, x0, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
         self.min_cutoff = min_cutoff
-        self.beta       = beta
-        self.d_cutoff   = d_cutoff
-        self.x_prev     = float(x0)
-        self.dx_prev    = 0.0
-        self.t_prev     = t0
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = float(x0)
+        self.dx_prev = 0.0
+        self.t_prev = t0
 
     @staticmethod
-    def _alpha(te, cutoff):
+    def alpha(te, cutoff):
         r = 2.0 * math.pi * cutoff * te
         return r / (r + 1.0)
 
     def __call__(self, t, x):
+
         te = t - self.t_prev
-        if te < 1e-9:
+        if te <= 0:
             te = 1e-6
-        ad     = self._alpha(te, self.d_cutoff)
-        dx     = (x - self.x_prev) / te
-        dx_hat = ad * dx + (1.0 - ad) * self.dx_prev
+
+        dx = (x - self.x_prev) / te
+        ad = self.alpha(te, self.d_cutoff)
+        dx_hat = ad * dx + (1 - ad) * self.dx_prev
+
         cutoff = self.min_cutoff + self.beta * abs(dx_hat)
-        a      = self._alpha(te, cutoff)
-        x_hat  = a * x + (1.0 - a) * self.x_prev
-        self.x_prev  = x_hat
+        a = self.alpha(te, cutoff)
+
+        x_hat = a * x + (1 - a) * self.x_prev
+
+        self.x_prev = x_hat
         self.dx_prev = dx_hat
-        self.t_prev  = t
+        self.t_prev = t
+
         return x_hat
 
 
 class PointStabilizer:
+
     def __init__(self, **kw):
-        self._fx = self._fy = None
-        self._kw = kw
+        self.fx = None
+        self.fy = None
+        self.kw = kw
 
     def update(self, t, x, y):
-        if self._fx is None:
-            self._fx = OneEuroFilter(t, x, **self._kw)
-            self._fy = OneEuroFilter(t, y, **self._kw)
+
+        if self.fx is None:
+            self.fx = OneEuroFilter(t, x, **self.kw)
+            self.fy = OneEuroFilter(t, y, **self.kw)
             return x, y
-        return self._fx(t, x), self._fy(t, y)
+
+        return self.fx(t, x), self.fy(t, y)
 
 
 class ScalarStabilizer:
+
     def __init__(self, **kw):
-        self._f  = None
-        self._kw = kw
+        self.f = None
+        self.kw = kw
 
     def update(self, t, v):
-        if self._f is None:
-            self._f = OneEuroFilter(t, v, **self._kw)
+
+        if self.f is None:
+            self.f = OneEuroFilter(t, v, **self.kw)
             return v
-        return self._f(t, v)
+
+        return self.f(t, v)
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  AR EARRING TRACKER                                          ║
-# ╚══════════════════════════════════════════════════════════════╝
+# -------------------------------------------------------
+# AR EAR TRACKER
+# -------------------------------------------------------
 class AREarTracker:
-    def __init__(self, earring_bgra: np.ndarray):
+
+    def __init__(self, earring_bgra):
+
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=False,
             min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
+            min_tracking_confidence=0.7
         )
 
         if earring_bgra.shape[2] == 3:
             earring_bgra = np.dstack(
                 [earring_bgra, np.full(earring_bgra.shape[:2], 255, np.uint8)]
             )
+
         self.earring_L = earring_bgra
         self.earring_R = cv2.flip(earring_bgra, 1)
 
         self.pos_L = PointStabilizer(min_cutoff=1.5, beta=0.5)
         self.pos_R = PointStabilizer(min_cutoff=1.5, beta=0.5)
-        self.sz_L  = ScalarStabilizer(min_cutoff=0.5, beta=0.05)
-        self.sz_R  = ScalarStabilizer(min_cutoff=0.5, beta=0.05)
+
+        self.sz_L = ScalarStabilizer(min_cutoff=0.5, beta=0.05)
+        self.sz_R = ScalarStabilizer(min_cutoff=0.5, beta=0.05)
 
         self.angle_stab = ScalarStabilizer(min_cutoff=1.2, beta=0.3)
         self.faceh_stab = ScalarStabilizer(min_cutoff=0.6, beta=0.05)
 
-        self.opacity_L   = 0.0
-        self.opacity_R   = 0.0
-        self.cache_L     = None
-        self.cache_R     = None
-        self.cache_angle = 0.0
-        self.t0          = time.time()
+        self.opacity_L = 0
+        self.opacity_R = 0
 
-    def _t(self):
+        self.cache_L = None
+        self.cache_R = None
+        self.cache_angle = 0
+
+        self.t0 = time.time()
+
+    def t(self):
         return time.time() - self.t0
 
-    def _visibility(self, lm, w, h):
-        nose = np.array([lm[NOSE].x * w, lm[NOSE].y * h])
-        L    = np.array([lm[LEFT_TRAG].x * w,  lm[LEFT_TRAG].y * h])
-        R    = np.array([lm[RIGHT_TRAG].x * w, lm[RIGHT_TRAG].y * h])
-        ld   = np.linalg.norm(L - nose)
-        rd   = np.linalg.norm(R - nose)
-        return (
-            ld / (rd + 1e-6) > VIS_RATIO_THRESH,
-            rd / (ld + 1e-6) > VIS_RATIO_THRESH,
-        )
+    def visibility(self, lm, w, h):
 
-    def _head_roll_deg(self, lm, w, h):
-        le = np.array([lm[LEFT_EYE_OUTER].x * w,  lm[LEFT_EYE_OUTER].y * h])
+        nose = np.array([lm[NOSE].x * w, lm[NOSE].y * h])
+        L = np.array([lm[LEFT_TRAG].x * w, lm[LEFT_TRAG].y * h])
+        R = np.array([lm[RIGHT_TRAG].x * w, lm[RIGHT_TRAG].y * h])
+
+        ld = np.linalg.norm(L - nose)
+        rd = np.linalg.norm(R - nose)
+
+        return ld / (rd + 1e-6) > VIS_RATIO_THRESH, rd / (ld + 1e-6) > VIS_RATIO_THRESH
+
+    def head_roll(self, lm, w, h):
+
+        le = np.array([lm[LEFT_EYE_OUTER].x * w, lm[LEFT_EYE_OUTER].y * h])
         re = np.array([lm[RIGHT_EYE_OUTER].x * w, lm[RIGHT_EYE_OUTER].y * h])
+
         return math.degrees(math.atan2(re[1] - le[1], re[0] - le[0]))
 
-    def _face_height(self, lm, w, h):
+    def face_height(self, lm, w, h):
+
         f = np.array([lm[FOREHEAD].x * w, lm[FOREHEAD].y * h])
-        c = np.array([lm[CHIN].x * w,     lm[CHIN].y * h])
+        c = np.array([lm[CHIN].x * w, lm[CHIN].y * h])
+
         return np.linalg.norm(c - f)
 
-    def _yaw_factors(self, lm, w, h):
-        nose = np.array([lm[NOSE].x * w, lm[NOSE].y * h])
-        L    = np.array([lm[LEFT_TRAG].x * w,  lm[LEFT_TRAG].y * h])
-        R    = np.array([lm[RIGHT_TRAG].x * w, lm[RIGHT_TRAG].y * h])
-        ld   = np.linalg.norm(L - nose)
-        rd   = np.linalg.norm(R - nose)
-        s    = ld + rd + 1e-6
-        return (
-            np.clip(ld / s * 2.0, 0.4, 1.0),
-            np.clip(rd / s * 2.0, 0.4, 1.0),
-        )
+    def estimate_lobe(self, lm, base, ref, w, h):
 
-    def _estimate_lobe(self, lm, base_id, ref_id, w, h):
-        bx, by = lm[base_id].x, lm[base_id].y
-        dx = bx - lm[ref_id].x
-        dy = by - lm[ref_id].y
+        bx, by = lm[base].x, lm[base].y
+        dx = bx - lm[ref].x
+        dy = by - lm[ref].y
+
         return (bx + dx * EARLOBE_OFFSET) * w, (by + dy * EARLOBE_OFFSET) * h
 
-    def _overlay(self, frame, earring_src, cx, cy, size, angle_deg, opacity):
-        if size < 4 or opacity < 0.01:
+    def overlay(self, frame, earring, cx, cy, size, angle, opacity):
+
+        if size < 5 or opacity < 0.01:
             return
+
         fh, fw = frame.shape[:2]
 
-        aspect = earring_src.shape[1] / earring_src.shape[0]
-        nh = max(int(size), 2)
-        nw = max(int(nh * aspect), 2)
-        ear = cv2.resize(earring_src, (nw, nh), interpolation=cv2.INTER_AREA)
+        aspect = earring.shape[1] / earring.shape[0]
+
+        nh = int(size)
+        nw = int(nh * aspect)
+
+        ear = cv2.resize(earring, (nw, nh))
 
         att_x = nw // 2
         att_y = int(nh * ANCHOR_Y_SHIFT)
-        angle_applied = angle_deg * TILT_DAMPING
-        M = cv2.getRotationMatrix2D((att_x, att_y), -angle_applied, 1.0)
 
-        cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
-        rw = int(nh * sin_a + nw * cos_a) + 2
-        rh = int(nh * cos_a + nw * sin_a) + 2
-        M[0, 2] += (rw - nw) / 2
-        M[1, 2] += (rh - nh) / 2
+        M = cv2.getRotationMatrix2D((att_x, att_y), -angle * TILT_DAMPING, 1)
 
         ear = cv2.warpAffine(
-            ear, M, (rw, rh),
+            ear,
+            M,
+            (nw, nh),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0),
+            borderValue=(0, 0, 0, 0)
         )
 
-        new_att = M @ np.array([att_x, att_y, 1.0])
-        ox = int(cx - new_att[0])
-        oy = int(cy - new_att[1])
+        ox = int(cx - att_x)
+        oy = int(cy - att_y)
 
         eh, ew = ear.shape[:2]
-        x1, y1, x2, y2     = ox, oy, ox + ew, oy + eh
-        sx1, sy1, sx2, sy2 = 0,  0,  ew,      eh
-        if x1 < 0:   sx1 -= x1;  x1 = 0
-        if y1 < 0:   sy1 -= y1;  y1 = 0
-        if x2 > fw:  sx2 -= (x2 - fw);  x2 = fw
-        if y2 > fh:  sy2 -= (y2 - fh);  y2 = fh
-        if x1 >= x2 or y1 >= y2:
+
+        if ox < 0 or oy < 0 or ox + ew > fw or oy + eh > fh:
             return
 
-        crop = ear[sy1:sy2, sx1:sx2]
-        if crop.size == 0:
-            return
+        alpha = ear[:, :, 3] / 255.0 * opacity
 
-        alpha = (crop[:, :, 3:4].astype(np.float32) / 255.0) * opacity
-        fg    = crop[:, :, :3].astype(np.float32)
-        roi   = frame[y1:y2, x1:x2].astype(np.float32)
-        frame[y1:y2, x1:x2] = (fg * alpha + roi * (1.0 - alpha)).astype(
-            np.uint8
-        )
+        for c in range(3):
+            frame[oy:oy + eh, ox:ox + ew, c] = (
+                ear[:, :, c] * alpha
+                + frame[oy:oy + eh, ox:ox + ew, c] * (1 - alpha)
+            )
 
-    def process(self, frame: np.ndarray) -> np.ndarray:
+    def process(self, frame):
+
         h, w = frame.shape[:2]
-        t    = self._t()
+        t = self.t()
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
+
         results = self.face_mesh.process(rgb)
-        rgb.flags.writeable = True
 
         if not results.multi_face_landmarks:
-            self.opacity_L = max(0.0, self.opacity_L - FADE_SPEED)
-            self.opacity_R = max(0.0, self.opacity_R - FADE_SPEED)
-            if self.cache_L and self.opacity_L > 0.01:
-                self._overlay(
-                    frame, self.earring_L,
-                    *self.cache_L, self.cache_angle, self.opacity_L,
-                )
-            if self.cache_R and self.opacity_R > 0.01:
-                self._overlay(
-                    frame, self.earring_R,
-                    *self.cache_R, self.cache_angle, self.opacity_R,
-                )
             return frame
 
         lm = results.multi_face_landmarks[0].landmark
-        show_L, show_R = self._visibility(lm, w, h)
 
-        fh      = self.faceh_stab.update(t, self._face_height(lm, w, h))
-        angle   = self.angle_stab.update(t, self._head_roll_deg(lm, w, h))
-        lf, rf  = self._yaw_factors(lm, w, h)
-        base_sz = fh * EARRING_SIZE_RATIO
+        show_L, show_R = self.visibility(lm, w, h)
+
+        fh = self.faceh_stab.update(t, self.face_height(lm, w, h))
+        angle = self.angle_stab.update(t, self.head_roll(lm, w, h))
+
+        base_size = fh * EARRING_SIZE_RATIO
 
         if show_L:
-            x, y = self._estimate_lobe(lm, LEFT_BASE, LEFT_REF, w, h)
-            x, y = self.pos_L.update(t, x, y)
-            sz   = self.sz_L.update(t, base_sz * lf)
-            self.opacity_L = min(1.0, self.opacity_L + FADE_SPEED)
-            self.cache_L   = (x, y, sz)
-        else:
-            self.opacity_L = max(0.0, self.opacity_L - FADE_SPEED)
 
-        if self.cache_L and self.opacity_L > 0.01:
-            self._overlay(
-                frame, self.earring_L,
-                *self.cache_L, angle, self.opacity_L,
-            )
+            x, y = self.estimate_lobe(lm, LEFT_BASE, LEFT_REF, w, h)
+            x, y = self.pos_L.update(t, x, y)
+
+            size = self.sz_L.update(t, base_size)
+
+            self.overlay(frame, self.earring_L, x, y, size, angle, 1)
 
         if show_R:
-            x, y = self._estimate_lobe(lm, RIGHT_BASE, RIGHT_REF, w, h)
+
+            x, y = self.estimate_lobe(lm, RIGHT_BASE, RIGHT_REF, w, h)
             x, y = self.pos_R.update(t, x, y)
-            sz   = self.sz_R.update(t, base_sz * rf)
-            self.opacity_R = min(1.0, self.opacity_R + FADE_SPEED)
-            self.cache_R   = (x, y, sz)
-        else:
-            self.opacity_R = max(0.0, self.opacity_R - FADE_SPEED)
 
-        if self.cache_R and self.opacity_R > 0.01:
-            self._overlay(
-                frame, self.earring_R,
-                *self.cache_R, angle, self.opacity_R,
-            )
+            size = self.sz_R.update(t, base_size)
 
-        self.cache_angle = angle
+            self.overlay(frame, self.earring_R, x, y, size, angle, 1)
+
         return frame
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  LOAD EARRING IMAGE (file upload or default)                 ║
-# ╚══════════════════════════════════════════════════════════════╝
-def load_earring_image(uploaded_file=None) -> np.ndarray:
-    """Return a BGRA numpy array for the earring."""
+# -------------------------------------------------------
+# EARRING IMAGE LOADER
+# -------------------------------------------------------
+def load_earring(uploaded):
 
-    if uploaded_file is not None:
-        raw = np.frombuffer(uploaded_file.read(), np.uint8)
+    if uploaded:
+
+        raw = np.frombuffer(uploaded.read(), np.uint8)
         img = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            return img
 
-    # fallback: load from disk
+        return img
+
     default = Path("earring.png")
-    if default.exists():
-        img = cv2.imread(str(default), cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            return img
 
-    # last resort: generate a simple magenta diamond placeholder
-    sz = 120
-    canvas = np.zeros((sz, sz, 4), dtype=np.uint8)
-    pts = np.array([[sz // 2, 0], [sz, sz // 2],
-                     [sz // 2, sz], [0, sz // 2]])
-    cv2.fillPoly(canvas, [pts], (255, 0, 255, 220))
+    if default.exists():
+
+        return cv2.imread(str(default), cv2.IMREAD_UNCHANGED)
+
+    canvas = np.zeros((120, 120, 4), dtype=np.uint8)
+
+    pts = np.array([[60, 0], [120, 60], [60, 120], [0, 60]])
+
+    cv2.fillPoly(canvas, [pts], (255, 0, 255, 200))
+
     return canvas
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  WEBRTC VIDEO PROCESSOR                                      ║
-# ╚══════════════════════════════════════════════════════════════╝
+# -------------------------------------------------------
+# WEBRTC PROCESSOR
+# -------------------------------------------------------
 class EarringProcessor(VideoProcessorBase):
-    """
-    streamlit-webrtc calls `recv()` on every video frame
-    from a background thread.  We keep the tracker as an
-    instance attribute so state persists across frames.
-    """
 
     def __init__(self):
+
         self.tracker = None
-        self._earring_img = None
+        self.img = None
 
-    def set_earring(self, earring_bgra: np.ndarray):
-        """Called from the Streamlit main thread."""
-        self._earring_img = earring_bgra
-        self.tracker = AREarTracker(earring_bgra)
+    def set_earring(self, img):
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        self.img = img
+        self.tracker = AREarTracker(img)
+
+    def recv(self, frame):
+
         img = frame.to_ndarray(format="bgr24")
 
-        # mirror for selfie view
         img = cv2.flip(img, 1)
 
-        if self.tracker is not None:
+        if self.tracker:
+
             img = self.tracker.process(img)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  STREAMLIT APP                                               ║
-# ╚══════════════════════════════════════════════════════════════╝
+# -------------------------------------------------------
+# STREAMLIT APP
+# -------------------------------------------------------
 def main():
+
     st.set_page_config(page_title="AR Earring Try-On", layout="wide")
+
     st.title("💎 AR Earring Virtual Try-On")
-    st.caption("Real-time earring overlay using MediaPipe Face Mesh + WebRTC")
 
-    # ── sidebar controls ──
+    if "earring_processor" not in st.session_state:
+        st.session_state.earring_processor = False
+
     with st.sidebar:
-        st.header("Settings")
-        uploaded = st.file_uploader(
-            "Upload earring image (PNG with transparency)",
-            type=["png", "webp", "jpg", "jpeg"],
-        )
-        st.markdown("---")
-        st.markdown(
-            "**Tips:**\n"
-            "- Use a PNG with transparent background\n"
-            "- Face the camera and ensure good lighting\n"
-            "- Turn your head to see earrings appear/disappear\n"
-        )
 
-    # load the earring once (or when upload changes)
-    earring_img = load_earring_image(uploaded)
+        uploaded = st.file_uploader("Upload earring PNG", type=["png", "jpg", "jpeg"])
 
-    # show a preview of what will be overlaid
+    earring = load_earring(uploaded)
+
     with st.sidebar:
-        st.image(
-            cv2.cvtColor(earring_img[:, :, :3], cv2.COLOR_BGR2RGB),
-            caption="Current earring",
-            width=120,
-        )
 
-    # ── STUN servers for NAT traversal ──
-    RTC_CONFIG = {
+        st.image(cv2.cvtColor(earring[:, :, :3], cv2.COLOR_BGR2RGB), width=120)
+
+    RTC_CONFIGURATION = {
         "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
     }
 
-    # ── launch the WebRTC streamer ──
     ctx = webrtc_streamer(
         key="earring-tryon",
         mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIG,
+        rtc_configuration=RTC_CONFIGURATION,
         video_processor_factory=EarringProcessor,
-        media_stream_constraints={
-            "video": {"width": {"ideal": 1280}, "height": {"ideal": 720}},
-            "audio": False,
-        },
-        async_processing=True,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=False
     )
 
-    # ── push the earring image into the processor ──
     if ctx.video_processor:
-        ctx.video_processor.set_earring(earring_img)
 
-    # ── footer ──
-    st.markdown("---")
-    st.markdown(
-        "Built with **Streamlit** · **streamlit-webrtc** · "
-        "**MediaPipe** · **OpenCV**"
-    )
+        if not st.session_state.earring_processor:
+
+            ctx.video_processor.set_earring(earring)
+
+            st.session_state.earring_processor = True
 
 
 if __name__ == "__main__":
