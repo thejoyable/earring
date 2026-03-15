@@ -1,264 +1,370 @@
-
-"""
-AR Earring Virtual Try-On – Streamlit + streamlit-webrtc
-"""
-
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
 import cv2
 import numpy as np
-import math
-import time
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
-import av
-from pathlib import Path
+import mediapipe as mp
+import os
+import threading
 
-# FIXED MEDIAPIPE IMPORT
-from mediapipe.python.solutions.face_mesh import FaceMesh
+# ================================================================
+# 1. MONKEY-PATCH: Fix the "_polling_thread is None" crash
+#    in older versions of streamlit-webrtc
+# ================================================================
+try:
+    import streamlit_webrtc.shutdown as _shutdown
 
+    _original_stop = _shutdown.SessionShutdownObserver.stop
 
-# CONFIG
-NOSE = 1
-LEFT_TRAG = 234
-RIGHT_TRAG = 454
-LEFT_EYE_OUTER = 33
-RIGHT_EYE_OUTER = 263
-LEFT_BASE = 93
-LEFT_REF = 123
-RIGHT_BASE = 323
-RIGHT_REF = 352
-FOREHEAD = 10
-CHIN = 152
+    def _safe_stop(self):
+        if getattr(self, "_polling_thread", None) is not None:
+            _original_stop(self)
 
-VIS_RATIO_THRESH = 0.75
-EARLOBE_OFFSET = 0.47
-EARRING_SIZE_RATIO = 0.25
-TILT_DAMPING = 0.35
-FADE_SPEED = 0.15
-ANCHOR_Y_SHIFT = 0.0
+    _shutdown.SessionShutdownObserver.stop = _safe_stop
+except Exception:
+    pass
 
 
-# ONE EURO FILTER
-class OneEuroFilter:
-    def __init__(self, t0, x0, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self.x_prev = float(x0)
-        self.dx_prev = 0.0
-        self.t_prev = t0
+# ================================================================
+# 2. ICE / TURN SERVER CONFIGURATION
+#    Without a TURN server, WebRTC will NOT work on Streamlit Cloud.
+#    Sign up for free TURN credentials at https://www.metered.ca/
+#    then add them in the Streamlit Cloud secrets dashboard.
+# ================================================================
+def get_ice_servers():
+    ice_servers = [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+    ]
 
-    @staticmethod
-    def _alpha(te, cutoff):
-        r = 2.0 * math.pi * cutoff * te
-        return r / (r + 1.0)
+    # --- Try loading TURN credentials from Streamlit secrets ---
+    try:
+        turn_urls = st.secrets["TURN_URLS"]        # e.g. "turn:a]relay1.expressturn.com:443"
+        turn_user = st.secrets["TURN_USERNAME"]
+        turn_cred = st.secrets["TURN_CREDENTIAL"]
 
-    def __call__(self, t, x):
-        te = t - self.t_prev
-        if te < 1e-9:
-            te = 1e-6
-        ad = self._alpha(te, self.d_cutoff)
-        dx = (x - self.x_prev) / te
-        dx_hat = ad * dx + (1 - ad) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
-        a = self._alpha(te, cutoff)
-        x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        self.t_prev = t
-        return x_hat
+        # Handle both single string and list
+        if isinstance(turn_urls, str):
+            turn_urls = [turn_urls]
 
-
-class PointStabilizer:
-    def __init__(self, **kw):
-        self._fx = self._fy = None
-        self._kw = kw
-
-    def update(self, t, x, y):
-        if self._fx is None:
-            self._fx = OneEuroFilter(t, x, **self._kw)
-            self._fy = OneEuroFilter(t, y, **self._kw)
-            return x, y
-        return self._fx(t, x), self._fy(t, y)
-
-
-class ScalarStabilizer:
-    def __init__(self, **kw):
-        self._f = None
-        self._kw = kw
-
-    def update(self, t, v):
-        if self._f is None:
-            self._f = OneEuroFilter(t, v, **self._kw)
-            return v
-        return self._f(t, v)
-
-
-# AR TRACKER
-class AREarTracker:
-    def __init__(self, earring_bgra):
-
-        self.face_mesh = FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
+        ice_servers.append(
+            {
+                "urls": turn_urls,
+                "username": turn_user,
+                "credential": turn_cred,
+            }
+        )
+    except Exception:
+        st.sidebar.warning(
+            "⚠️ No TURN server configured.\n\n"
+            "WebRTC **will not work** on Streamlit Cloud without one.\n\n"
+            "Add `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` "
+            "to your app's **Secrets** in the Streamlit Cloud dashboard.\n\n"
+            "Get free credentials → [metered.ca](https://www.metered.ca/)"
         )
 
-        if earring_bgra.shape[2] == 3:
-            earring_bgra = np.dstack(
-                [earring_bgra, np.full(earring_bgra.shape[:2], 255, np.uint8)]
-            )
-
-        self.earring_L = earring_bgra
-        self.earring_R = cv2.flip(earring_bgra, 1)
-
-        self.pos_L = PointStabilizer(min_cutoff=1.5, beta=0.5)
-        self.pos_R = PointStabilizer(min_cutoff=1.5, beta=0.5)
-        self.sz_L = ScalarStabilizer(min_cutoff=0.5, beta=0.05)
-        self.sz_R = ScalarStabilizer(min_cutoff=0.5, beta=0.05)
-
-        self.angle_stab = ScalarStabilizer(min_cutoff=1.2, beta=0.3)
-        self.faceh_stab = ScalarStabilizer(min_cutoff=0.6, beta=0.05)
-
-        self.opacity_L = 0.0
-        self.opacity_R = 0.0
-        self.cache_L = None
-        self.cache_R = None
-        self.cache_angle = 0.0
-        self.t0 = time.time()
-
-    def _t(self):
-        return time.time() - self.t0
-
-    def process(self, frame):
-
-        h, w = frame.shape[:2]
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = self.face_mesh.process(rgb)
-        rgb.flags.writeable = True
-
-        if not results.multi_face_landmarks:
-            return frame
-
-        lm = results.multi_face_landmarks[0].landmark
-
-        bx = lm[LEFT_BASE].x * w
-        by = lm[LEFT_BASE].y * h
-        rx = lm[LEFT_REF].x * w
-        ry = lm[LEFT_REF].y * h
-
-        lx = bx + (bx - rx) * EARLOBE_OFFSET
-        ly = by + (by - ry) * EARLOBE_OFFSET
-
-        bx = lm[RIGHT_BASE].x * w
-        by = lm[RIGHT_BASE].y * h
-        rx = lm[RIGHT_REF].x * w
-        ry = lm[RIGHT_REF].y * h
-
-        rx = bx + (bx - rx) * EARLOBE_OFFSET
-        ry = by + (by - ry) * EARLOBE_OFFSET
-
-        self._overlay(frame, self.earring_L, lx, ly)
-        self._overlay(frame, self.earring_R, rx, ry)
-
-        return frame
-
-    def _overlay(self, frame, earring, cx, cy):
-
-        h, w = frame.shape[:2]
-
-        size = int(min(h, w) * 0.12)
-
-        ear = cv2.resize(earring, (size, size))
-
-        x = int(cx - size // 2)
-        y = int(cy)
-
-        if x < 0 or y < 0 or x + size > w or y + size > h:
-            return
-
-        alpha = ear[:, :, 3] / 255.0
-
-        for c in range(3):
-            frame[y:y + size, x:x + size, c] = (
-                ear[:, :, c] * alpha
-                + frame[y:y + size, x:x + size, c] * (1 - alpha)
-            )
+    return ice_servers
 
 
-# LOAD EARRING
-def load_earring_image(uploaded_file=None):
-
-    if uploaded_file is not None:
-        raw = np.frombuffer(uploaded_file.read(), np.uint8)
-        img = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            return img
-
-    default = Path("earring.png")
-    if default.exists():
-        return cv2.imread(str(default), cv2.IMREAD_UNCHANGED)
-
-    canvas = np.zeros((120, 120, 4), dtype=np.uint8)
-    pts = np.array([[60, 0], [120, 60], [60, 120], [0, 60]])
-    cv2.fillPoly(canvas, [pts], (255, 0, 255, 220))
-    return canvas
+RTC_CONFIGURATION = RTCConfiguration({"iceServers": get_ice_servers()})
 
 
+# ================================================================
+# 3. MEDIAPIPE FACE-MESH LANDMARK INDICES
+# ================================================================
+# Earlobe attachment points
+LEFT_EARLOBE = 177      # Bottom of left ear / jawline
+RIGHT_EARLOBE = 401     # Bottom of right ear / jawline
+
+# Ear tragion points (for sizing reference)
+LEFT_EAR_TRAGION = 234
+RIGHT_EAR_TRAGION = 454
+
+# Face width reference
+FACE_LEFT = 234
+FACE_RIGHT = 454
+
+
+# ================================================================
+# 4. EARRING VIDEO PROCESSOR
+# ================================================================
 class EarringProcessor(VideoProcessorBase):
-
     def __init__(self):
-        self.tracker = None
+        self._earring_bgr = None          # Earring image (BGRA, 4 channels)
+        self._lock = threading.Lock()
+        self._scale = 0.22                 # Earring size relative to face width
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-    def set_earring(self, earring_bgra):
-        self.tracker = AREarTracker(earring_bgra)
+    # --- Thread-safe earring getter / setter ---
+    @property
+    def earring_image(self):
+        with self._lock:
+            return self._earring_bgr
 
-    def recv(self, frame):
+    @earring_image.setter
+    def earring_image(self, value):
+        with self._lock:
+            self._earring_bgr = value
 
+    @property
+    def scale(self):
+        with self._lock:
+            return self._scale
+
+    @scale.setter
+    def scale(self, value):
+        with self._lock:
+            self._scale = value
+
+    # --- Alpha-composite overlay ---
+    @staticmethod
+    def overlay_transparent(background, overlay, x, y, ow, oh):
+        """Place a BGRA overlay onto a BGR background at (x, y) with size (ow, oh)."""
+        if overlay is None or ow <= 0 or oh <= 0:
+            return background
+
+        try:
+            overlay_resized = cv2.resize(overlay, (ow, oh), interpolation=cv2.INTER_AREA)
+        except Exception:
+            return background
+
+        bg_h, bg_w = background.shape[:2]
+
+        # Clip to image boundaries
+        y1, y2 = max(0, y), min(bg_h, y + oh)
+        x1, x2 = max(0, x), min(bg_w, x + ow)
+        oy1, oy2 = y1 - y, y1 - y + (y2 - y1)
+        ox1, ox2 = x1 - x, x1 - x + (x2 - x1)
+
+        if y2 <= y1 or x2 <= x1:
+            return background
+
+        if overlay_resized.shape[2] == 4:
+            alpha = overlay_resized[oy1:oy2, ox1:ox2, 3].astype(np.float32) / 255.0
+            a3 = np.stack([alpha] * 3, axis=-1)
+            roi = background[y1:y2, x1:x2].astype(np.float32)
+            fg = overlay_resized[oy1:oy2, ox1:ox2, :3].astype(np.float32)
+            background[y1:y2, x1:x2] = (a3 * fg + (1.0 - a3) * roi).astype(np.uint8)
+        else:
+            background[y1:y2, x1:x2] = overlay_resized[oy1:oy2, ox1:ox2, :3]
+
+        return background
+
+    # --- Process each video frame ---
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
+        earring = self.earring_image
 
-        if self.tracker:
-            img = self.tracker.process(img)
+        if earring is None:
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        h, w = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        if results.multi_face_landmarks:
+            for fl in results.multi_face_landmarks:
+                # --- Compute face width for proportional earring sizing ---
+                lf = fl.landmark[FACE_LEFT]
+                rf = fl.landmark[FACE_RIGHT]
+                face_w = abs(rf.x - lf.x) * w
+
+                # --- Earring dimensions ---
+                ew = max(10, int(face_w * self.scale))
+                aspect = earring.shape[0] / max(earring.shape[1], 1)
+                eh = max(10, int(ew * aspect))
+
+                # --- Left earring ---
+                ll = fl.landmark[LEFT_EARLOBE]
+                lx = int(ll.x * w) - ew // 2
+                ly = int(ll.y * h)
+                img = self.overlay_transparent(img, earring, lx, ly, ew, eh)
+
+                # --- Right earring (mirror) ---
+                earring_flip = cv2.flip(earring, 1)
+                rl = fl.landmark[RIGHT_EARLOBE]
+                rx = int(rl.x * w) - ew // 2
+                ry = int(rl.y * h)
+                img = self.overlay_transparent(img, earring_flip, rx, ry, ew, eh)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-def main():
+# ================================================================
+# 5. EARRING IMAGE HELPERS
+# ================================================================
+EARRING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "earrings")
 
-    st.set_page_config(page_title="AR Earring Try-On", layout="wide")
-    st.title("💎 AR Earring Virtual Try-On")
 
-    with st.sidebar:
-        uploaded = st.file_uploader(
-            "Upload earring image",
-            type=["png", "jpg", "jpeg", "webp"],
-        )
+def get_earring_catalog():
+    """Return dict {display_name: filepath} of earring PNGs."""
+    if not os.path.isdir(EARRING_DIR):
+        os.makedirs(EARRING_DIR, exist_ok=True)
 
-    earring_img = load_earring_image(uploaded)
+    catalog = {}
+    for f in sorted(os.listdir(EARRING_DIR)):
+        if f.lower().endswith((".png", ".webp", ".jpg", ".jpeg")):
+            name = os.path.splitext(f)[0].replace("_", " ").replace("-", " ").title()
+            catalog[name] = os.path.join(EARRING_DIR, f)
+    return catalog
 
-    with st.sidebar:
-        st.image(cv2.cvtColor(earring_img[:, :, :3], cv2.COLOR_BGR2RGB), width=120)
 
-    RTC_CONFIG = {
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+def create_sample_earrings():
+    """Generate simple placeholder earrings if the folder is empty."""
+    os.makedirs(EARRING_DIR, exist_ok=True)
+    if any(f.endswith(".png") for f in os.listdir(EARRING_DIR)):
+        return  # already have images
+
+    samples = {
+        "gold_stud":    (0, 215, 255),
+        "silver_hoop":  (192, 192, 192),
+        "ruby_drop":    (60, 20, 220),
+        "emerald_gem":  (50, 180, 50),
+        "sapphire_gem": (200, 100, 30),
     }
 
-    ctx = webrtc_streamer(
-        key="earring-tryon",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIG,
-        video_processor_factory=EarringProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=False,
+    for name, bgr in samples.items():
+        canvas = np.zeros((100, 50, 4), dtype=np.uint8)
+        # connector line
+        cv2.line(canvas, (25, 0), (25, 25), (*bgr, 200), 2)
+        # gem body
+        cv2.circle(canvas, (25, 55), 20, (*bgr, 255), -1)
+        # highlight
+        cv2.circle(canvas, (18, 48), 6, (255, 255, 255, 160), -1)
+
+        cv2.imwrite(os.path.join(EARRING_DIR, f"{name}.png"), canvas)
+
+
+def load_earring_cv2(path: str):
+    """Load an earring image as BGRA numpy array."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is not None and img.shape[2] == 3:
+        # Add alpha channel if missing
+        alpha = np.full((*img.shape[:2], 1), 255, dtype=np.uint8)
+        img = np.concatenate([img, alpha], axis=-1)
+    return img
+
+
+# ================================================================
+# 6. STREAMLIT UI
+# ================================================================
+def main():
+    st.set_page_config(
+        page_title="✨ Virtual Earring Try-On",
+        page_icon="💎",
+        layout="wide",
     )
 
-    if ctx.video_processor:
-        ctx.video_processor.set_earring(earring_img)
+    st.title("✨ Virtual Earring Try-On")
+    st.caption("See how earrings look on you — in real time!")
+
+    # Make sure we have at least sample earrings
+    create_sample_earrings()
+
+    # ------ SIDEBAR ------
+    st.sidebar.header("💎 Earring Selection")
+
+    catalog = get_earring_catalog()
+
+    # Selector
+    earring_choice = st.sidebar.selectbox(
+        "Choose from collection",
+        options=["— None —"] + list(catalog.keys()),
+    )
+
+    # Upload
+    uploaded_file = st.sidebar.file_uploader(
+        "…or upload your own (PNG with transparency)",
+        type=["png", "webp"],
+    )
+
+    # Scale slider
+    earring_scale = st.sidebar.slider(
+        "Earring size",
+        min_value=0.08,
+        max_value=0.50,
+        value=0.22,
+        step=0.02,
+    )
+
+    # Resolve the earring image
+    earring_img = None
+
+    if uploaded_file is not None:
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        earring_img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+        if earring_img is not None and earring_img.shape[2] == 3:
+            alpha = np.full((*earring_img.shape[:2], 1), 255, dtype=np.uint8)
+            earring_img = np.concatenate([earring_img, alpha], axis=-1)
+        st.sidebar.image(uploaded_file, caption="Your earring", width=80)
+
+    elif earring_choice != "— None —":
+        earring_img = load_earring_cv2(catalog[earring_choice])
+        st.sidebar.image(catalog[earring_choice], caption=earring_choice, width=80)
+
+    # Instructions
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        """
+        ### 📋 How to use
+        1. **Allow** camera access when prompted
+        2. **Pick** an earring or upload your own PNG
+        3. **Adjust** the size slider
+        4. Face the camera — earrings appear automatically!
+
+        ### 💡 Tips
+        - Use **good lighting** for best detection
+        - Face the camera **straight on**
+        - PNG with **transparent background** works best
+        """
+    )
+
+    # ------ MAIN AREA: WebRTC ------
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        ctx = webrtc_streamer(
+            key="earring-tryon",
+            video_processor_factory=EarringProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 24},
+                },
+                "audio": False,
+            },
+            async_processing=True,
+        )
+
+    with col2:
+        st.markdown("#### 🎥 Status")
+        if ctx.state.playing:
+            st.success("Camera is active")
+        else:
+            st.info("Click **START** to begin")
+
+    # Push selected earring into the running processor
+    if ctx.video_processor is not None:
+        ctx.video_processor.earring_image = earring_img
+        ctx.video_processor.scale = earring_scale
+
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "<div style='text-align:center; color:gray;'>"
+        "Built with Streamlit · MediaPipe · streamlit-webrtc"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
     main()
-
